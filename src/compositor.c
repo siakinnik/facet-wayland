@@ -53,7 +53,8 @@ struct fw_display {
     char socket_path[108];
     int listen_fd;
     struct wl_event_source* listen_source;
-    int x, w, h, inset;
+    int x, w, h, inset;  // w, h, inset in pixels
+    int scale;            // output scale; windows, layout and input use w / scale
     bool visible, pending, force;
     struct wlr_output* output;
     struct wlr_scene_output* scene_output;
@@ -129,6 +130,7 @@ struct fw_server {
     bool touching, touch_pointer;
     double touch_ox, touch_oy;
     char* text_module;  // module whose text field has the keyboard, NULL if none
+    bool text_numeric;
 
     struct wl_listener new_output, new_toplevel, new_popup, new_decoration, new_text_input;
     struct wl_listener request_selection, request_primary_selection;
@@ -147,6 +149,13 @@ static void set_error(char* error, int len, const char* fmt, ...) {
     vsnprintf(error, (size_t)len, fmt, ap);
     va_end(ap);
 }
+
+// High-density screens get scale 2, so apps are as large as Facet's own UI.
+static int scale_for(int h) { return h >= 1800 ? 2 : 1; }
+
+// Logical (surface-local) size of a display, as windows see it.
+static int lw(const struct fw_display* d) { return d->w / d->scale; }
+static int lh(const struct fw_display* d) { return (d->h - d->inset) / d->scale; }
 
 static struct fw_display* find_display(struct fw_server* s, const char* module) {
     struct fw_display* d;
@@ -182,19 +191,26 @@ static struct fw_text_input* focused_input(struct fw_server* s) {
     return NULL;
 }
 
+// text-input-v3 content purposes that want a numeric keyboard: digits,
+// number, phone, PIN.
+static bool numeric_purpose(uint32_t purpose) { return purpose == 2 || purpose == 4 || purpose == 5 || purpose == 10; }
+
 static void update_text_wanted(struct fw_server* s) {
     struct fw_text_input* ti = focused_input(s);
     struct fw_display* d = visible_display(s);
     const char* module = ti && ti->input->current_enabled && d ? d->module : NULL;
-    if ((!module && !s->text_module) || (module && s->text_module && strcmp(module, s->text_module) == 0)) return;
-    if (s->text_module) {
-        s->cb.text_input(s->cb.data, s->text_module, false);
-        free(s->text_module);
-        s->text_module = NULL;
-    }
+    bool numeric = module && numeric_purpose(ti->input->current.content_type.purpose);
+    if ((!module && !s->text_module) ||
+        (module && s->text_module && strcmp(module, s->text_module) == 0 && numeric == s->text_numeric))
+        return;
+    if (s->text_module && (!module || strcmp(module, s->text_module) != 0))
+        s->cb.text_input(s->cb.data, s->text_module, false, false);
+    free(s->text_module);
+    s->text_module = NULL;
     if (module) {
         s->text_module = strdup(module);
-        s->cb.text_input(s->cb.data, module, true);
+        s->text_numeric = numeric;
+        s->cb.text_input(s->cb.data, module, true, numeric);
     }
 }
 
@@ -291,7 +307,7 @@ static void configure_view(struct fw_view* v) {
         return;
     }
     // Apps fill their display, like on a phone; no window frames to drag.
-    wlr_xdg_toplevel_set_size(v->toplevel, d->w, d->h - d->inset > 1 ? d->h - d->inset : 1);
+    wlr_xdg_toplevel_set_size(v->toplevel, lw(d), lh(d) > 1 ? lh(d) : 1);
     wlr_xdg_toplevel_set_maximized(v->toplevel, true);
     wlr_xdg_toplevel_set_tiled(v->toplevel, WLR_EDGE_TOP | WLR_EDGE_BOTTOM | WLR_EDGE_LEFT | WLR_EDGE_RIGHT);
 }
@@ -300,7 +316,7 @@ static void center_dialog(struct fw_view* v) {
     if (!v->toplevel->parent) return;
     struct wlr_box geo;
     wlr_xdg_surface_get_geometry(v->toplevel->base, &geo);
-    int x = (v->display->w - geo.width) / 2, y = (v->display->h - v->display->inset - geo.height) / 2;
+    int x = (lw(v->display) - geo.width) / 2, y = (lh(v->display) - geo.height) / 2;
     wlr_scene_node_set_position(&v->tree->node, x > 0 ? x : 0, y > 0 ? y : 0);
 }
 
@@ -423,7 +439,7 @@ static void popup_commit(struct wl_listener* l, void* data) {
     int tx = 0, ty = 0;
     struct wlr_scene_tree* tree = root->data;
     if (tree) wlr_scene_node_coords(&tree->node, &tx, &ty);
-    struct wlr_box box = {p->display->x - tx, -ty, p->display->w, p->display->h - p->display->inset};
+    struct wlr_box box = {p->display->x - tx, -ty, lw(p->display), lh(p->display)};
     wlr_xdg_popup_unconstrain_from_box(p->popup, &box);
     wlr_xdg_surface_schedule_configure(p->popup->base);
 }
@@ -571,6 +587,7 @@ static void new_output(struct wl_listener* l, void* data) {
     wlr_output_state_init(&state);
     wlr_output_state_set_enabled(&state, true);
     wlr_output_state_set_custom_mode(&state, d->w, d->h, 60000);
+    wlr_output_state_set_scale(&state, (float)d->scale);
     wlr_output_commit_state(output, &state);
     wlr_output_state_finish(&state);
     d->output = output;
@@ -801,6 +818,7 @@ bool fw_display_add(struct fw_server* s, const char* module, const char* socket_
     d->module = strdup(module);
     d->w = w > 0 ? w : 1280;
     d->h = h > 0 ? h : 800;
+    d->scale = scale_for(d->h);
     d->x = s->next_slot++ * DISPLAY_SPACING;
     d->listen_fd = -1;
     wl_list_init(&d->views);
@@ -824,7 +842,7 @@ bool fw_display_add(struct fw_server* s, const char* module, const char* socket_
     d->root = wlr_scene_tree_create(&s->scene->tree);
     wlr_scene_node_set_position(&d->root->node, d->x, 0);
     const float black[4] = {0, 0, 0, 1};
-    d->background = wlr_scene_rect_create(d->root, d->w, d->h, black);
+    d->background = wlr_scene_rect_create(d->root, lw(d), d->h / d->scale, black);
     wl_list_insert(s->displays.prev, &d->link);
     s->adding = d;
     wlr_headless_add_output(s->backend, (unsigned)d->w, (unsigned)d->h);
@@ -873,11 +891,13 @@ void fw_display_resize(struct fw_server* s, const char* module, int w, int h) {
     if (!d || w <= 0 || h <= 0 || (w == d->w && h == d->h)) return;
     d->w = w;
     d->h = h;
-    wlr_scene_rect_set_size(d->background, w, h);
+    d->scale = scale_for(h);
+    wlr_scene_rect_set_size(d->background, lw(d), h / d->scale);
     if (d->output) {
         struct wlr_output_state state;
         wlr_output_state_init(&state);
         wlr_output_state_set_custom_mode(&state, w, h, 60000);
+        wlr_output_state_set_scale(&state, (float)d->scale);
         wlr_output_commit_state(d->output, &state);
         wlr_output_state_finish(&state);
     }
@@ -939,7 +959,7 @@ static void raise_window_of(struct fw_display* d, struct wlr_surface* surface) {
 void fw_touch(struct fw_server* s, const char* module, enum fw_touch_kind kind, double x, double y) {
     struct fw_display* d = find_display(s, module);
     if (!d) return;
-    double lx = d->x + x, ly = y;
+    double lx = d->x + x / d->scale, ly = y / d->scale;
     uint32_t t = now_ms();
     if (kind == FW_TOUCH_DOWN) {
         double sx = 0, sy = 0;

@@ -24,8 +24,9 @@ struct fw_callbacks {
     // stride w), or NULL if it cannot take one now (call fw_server_kick later).
     uint32_t* (*frame_target)(void* data, const char* module, int w, int h);
     void (*frame_done)(void* data, const char* module);
-    // A text field of the module's focused window wants the keyboard (or not).
-    void (*text_input)(void* data, const char* module, bool active);
+    // A text field of the module's focused window wants the keyboard (or
+    // not); `numeric` for digits, numbers, phone numbers and PINs.
+    void (*text_input)(void* data, const char* module, bool active, bool numeric);
     void (*windows_changed)(void* data);
 };
 

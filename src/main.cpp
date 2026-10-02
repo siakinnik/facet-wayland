@@ -44,8 +44,8 @@ public:
             return static_cast<Server*>(self)->frame_target(module, w, h);
         };
         cb.frame_done = [](void* self, const char* module) { static_cast<Server*>(self)->frame_done(module); };
-        cb.text_input = [](void* self, const char* module, bool active) {
-            static_cast<Server*>(self)->text_input(module, active);
+        cb.text_input = [](void* self, const char* module, bool active, bool numeric) {
+            static_cast<Server*>(self)->text_input(module, active, numeric);
         };
         cb.windows_changed = [](void* self) { static_cast<Server*>(self)->windows_dirty_ = true; };
         char err[256] = {};
@@ -190,9 +190,9 @@ private:
         if (it != displays_.end()) it->second.surface->present();
     }
 
-    void text_input(const char* module, bool active) {
+    void text_input(const char* module, bool active, bool numeric) {
         text_module_ = active ? module : "";
-        plugin_.text_input(active);
+        plugin_.text_input(active, numeric ? "number" : "text");
     }
 
     void report_windows() {
