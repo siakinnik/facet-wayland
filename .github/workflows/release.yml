@@ -1,0 +1,124 @@
+name: Release
+
+# Run from the Actions tab ("Run workflow"): tags the current commit with the
+# version from CMakeLists.txt, builds a static binary (x86_64)
+# and publishes a GitHub release. Pushing a matching tag by hand works too.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check translations
+        run: python3 scripts/check_i18n.py
+
+      - name: Determine version and tag
+        id: version
+        run: |
+          version="$(bash scripts/version.sh)"
+          tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ "$GITHUB_REF_NAME" != "$tag" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version $version in CMakeLists.txt"
+              exit 1
+            fi
+          else
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "::error::Tag $tag already exists. Bump the version in CMakeLists.txt and manifest.json first."
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "wayland $version"
+            git push origin "$tag"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true"; else echo "prerelease=false"; fi >> "$GITHUB_OUTPUT"
+
+  # x86_64 only for now: wlroots and its libraries are built from source
+  # with meson, cross builds need meson cross files first.
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config bison python3-venv \
+            libffi-dev libexpat1-dev
+
+      - uses: actions/cache@v4
+        with:
+          path: third_party/deps
+          key: deps-x86_64-${{ runner.os }}-${{ hashFiles('DEPS', 'scripts/build-deps.sh') }}
+
+      - name: Build static binary
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DWAYLAND_STATIC=ON -DWAYLAND_EXAMPLES=OFF
+          cmake --build build --target wayland
+          file build/wayland.plugin/wayland
+
+      - name: Protocol smoke test
+        run: bash scripts/ci/smoke.sh build/wayland.plugin/wayland
+
+      - name: Package
+        run: bash scripts/ci/package.sh build/wayland.plugin/wayland "${{ needs.prepare.outputs.version }}" x86_64 dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wayland-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          Install or update on a device running Facet 0.6+ (x86_64):
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/siakinnik/facet-core/main/scripts/get.sh | sudo bash -s -- --plugin ${GITHUB_REPOSITORY} --version ${TAG}
+          \`\`\`
+          EOF
+          flags=()
+          [[ "${{ needs.prepare.outputs.prerelease }}" == true ]] && flags+=(--prerelease)
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "wayland $VERSION" --notes-file notes.md --generate-notes "${flags[@]}"

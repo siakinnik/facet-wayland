@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config bison python3-venv \
+            libffi-dev libexpat1-dev
+
+      - name: Check that code is English (translations only in i18n/)
+        run: python3 scripts/check_i18n.py
+
+      - name: Check version consistency (CMakeLists.txt vs manifest.json)
+        run: bash scripts/version.sh
+
+      - uses: actions/cache@v4
+        with:
+          path: third_party/deps
+          key: deps-x86_64-${{ runner.os }}-${{ hashFiles('DEPS', 'scripts/build-deps.sh') }}
+
+      - name: Build (SDK downloaded from facet-core, bundled libraries built once)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Build (static, as released)
+        run: |
+          cmake -S . -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release -DWAYLAND_STATIC=ON -DWAYLAND_EXAMPLES=OFF
+          cmake --build build-static --target wayland
+          file build-static/wayland.plugin/wayland
+
+      - name: Protocol smoke test
+        run: bash scripts/ci/smoke.sh build-static/wayland.plugin/wayland

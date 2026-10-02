@@ -1,0 +1,14 @@
+{
+  "id": "wayland",
+  "name": { "en": "Wayland", "ru": "Wayland" },
+  "version": "0.1.0-alpha",
+  "api": 3,
+  "exec": "wayland",
+  "permissions": [
+    "background",
+    { "name": "display.surface", "reason": { "en": "Shows the windows of desktop apps.", "ru": "Показывает окна приложений для компьютера." } },
+    { "name": "wayland.compositor", "reason": { "en": "Runs the display server that desktop apps connect to.", "ru": "Запускает дисплейный сервер, к которому подключаются приложения для компьютера." } }
+  ],
+  "provides": [{ "name": "display.wayland@1", "endpoint": true }],
+  "settings": true
+}

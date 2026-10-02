@@ -1,0 +1,13 @@
+{
+  "id": "desktop-app",
+  "name": { "en": "Desktop app", "ru": "Приложение для компьютера" },
+  "version": "0.1.0",
+  "api": 3,
+  "exec": "desktop-app",
+  "permissions": [
+    "wayland.window",
+    { "name": "wayland.clipboard", "optional": true }
+  ],
+  "requires": [{ "name": "display.wayland@1", "install": "siakinnik/facet-wayland" }],
+  "tile": { "icon": "plugin" }
+}
