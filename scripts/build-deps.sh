@@ -52,7 +52,7 @@ grep -v '^#' "$root/DEPS" | while read -r name version url; do
     git -c advice.detachedHead=false clone -q --depth 1 --branch "$version" "$url" "$work/$name"
     # shellcheck disable=SC2046
     "$meson" setup "$work/$name/build" "$work/$name" --prefix "$prefix" --libdir lib --buildtype release \
-        -Ddefault_library=static -Dprefer_static=true $(options "$name") >"$work/$name.log" 2>&1 ||
+        -Ddefault_library=static $(options "$name") >"$work/$name.log" 2>&1 ||
         { cat "$work/$name.log"; exit 1; }
     ninja -C "$work/$name/build" -j "$jobs" install >>"$work/$name.log" 2>&1 || { tail -50 "$work/$name.log"; exit 1; }
 done
