@@ -56,6 +56,11 @@ struct fw_display {
     int x, w, h, inset;  // w, h, inset in pixels
     int scale;            // output scale; windows, layout and input use w / scale
     bool visible, pending, force;
+    // Frame statistics, logged every 30 s while on screen.
+    struct {
+        int frames, idle, waits, commits;
+        double render_ms, copy_ms, wait_ms, wait_since, since;
+    } stats;
     struct wlr_output* output;
     struct wlr_scene_output* scene_output;
     struct wlr_scene_tree* root;
@@ -140,6 +145,15 @@ static uint32_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+// Runs what wlroots deferred to "idle" (frame scheduling above all) and sends
+// pending events. The event loop is driven from the plugin's own loop, which
+// only dispatches when the loop's fd is readable, and idle work does not make
+// it readable: without this, frames would wait for the next unrelated event.
+static void flush(struct fw_server* s) {
+    wl_event_loop_dispatch_idle(s->loop);
+    wl_display_flush_clients(s->display);
 }
 
 static void set_error(char* error, int len, const char* fmt, ...) {
@@ -323,6 +337,7 @@ static void center_dialog(struct fw_view* v) {
 static void view_commit(struct wl_listener* l, void* data) {
     (void)data;
     struct fw_view* v = wl_container_of(l, v, commit);
+    v->display->stats.commits++;
     if (v->toplevel->base->initial_commit) configure_view(v);
     else if (v->mapped) center_dialog(v);
 }
@@ -521,6 +536,28 @@ static void request_primary_selection(struct wl_listener* l, void* data) {
 
 // ------------------------------------------------------------------ outputs and frames
 
+static double now_ms_f(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static void log_stats(struct fw_display* d) {
+    double t = now_ms_f();
+    if (d->stats.since == 0) d->stats.since = t;
+    double span = t - d->stats.since;
+    if (span < 30000) return;
+    int f = d->stats.frames;
+    if (f || d->stats.waits || d->stats.commits)
+        fprintf(stderr,
+                "wayland: %s: %.1f fps, %d app commits, %d idle frames, %d waits for Facet (%.1f ms total), "
+                "render %.1f ms, copy %.1f ms per frame\n",
+                d->module, f * 1000.0 / span, d->stats.commits, d->stats.idle, d->stats.waits, d->stats.wait_ms,
+                f ? d->stats.render_ms / f : 0.0, f ? d->stats.copy_ms / f : 0.0);
+    memset(&d->stats, 0, sizeof d->stats);
+    d->stats.since = t;
+}
+
 static void send_frame_done(struct fw_display* d) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -534,19 +571,30 @@ static void display_frame(struct wl_listener* l, void* data) {
     // Hidden: no frames, so clients stop drawing too.
     if (!d->visible || !d->scene_output) return;
     bool damaged = d->output->needs_frame || pixman_region32_not_empty(&d->scene_output->damage_ring.current);
+    log_stats(d);
     if (!d->force && !damaged) {
+        d->stats.idle++;
         send_frame_done(d);
         return;
     }
     uint32_t* dst = s->cb.frame_target(s->cb.data, d->module, d->w, d->h);
     if (!dst) {
-            d->pending = true;  // Facet has not taken the previous frame yet
+        if (!d->pending) {
+            d->stats.waits++;
+            d->stats.wait_since = now_ms_f();
+        }
+        d->pending = true;  // Facet has not taken the previous frame yet
         return;
     }
+    if (d->stats.wait_since > 0) {
+        d->stats.wait_ms += now_ms_f() - d->stats.wait_since;
+        d->stats.wait_since = 0;
+    }
+    double t0 = now_ms_f();
     struct wlr_output_state state;
     wlr_output_state_init(&state);
     if (!wlr_scene_output_build_state(d->scene_output, &state, NULL)) {
-            wlr_output_state_finish(&state);
+        wlr_output_state_finish(&state);
         return;
     }
     if ((state.committed & WLR_OUTPUT_STATE_BUFFER) && state.buffer) {
@@ -556,9 +604,13 @@ static void display_frame(struct wl_listener* l, void* data) {
         if (wlr_buffer_begin_data_ptr_access(state.buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &px, &format, &stride)) {
             int w = state.buffer->width < d->w ? state.buffer->width : d->w;
             int h = state.buffer->height < d->h ? state.buffer->height : d->h;
+            double t1 = now_ms_f();
+            d->stats.render_ms += t1 - t0;
+            d->stats.frames++;
             // XRGB8888 and ARGB8888 share the layout Facet expects.
             for (int y = 0; y < h; ++y) memcpy(dst + (size_t)y * (size_t)d->w, (char*)px + (size_t)y * stride, (size_t)w * 4);
             wlr_buffer_end_data_ptr_access(state.buffer);
+            d->stats.copy_ms += now_ms_f() - t1;
             s->cb.frame_done(s->cb.data, d->module);
             d->force = false;
         }
@@ -793,7 +845,7 @@ int fw_server_fd(struct fw_server* s) { return wl_event_loop_get_fd(s->loop); }
 
 void fw_server_dispatch(struct fw_server* s) {
     wl_event_loop_dispatch(s->loop, 0);
-    wl_display_flush_clients(s->display);
+    flush(s);
 }
 
 void fw_server_kick(struct fw_server* s) {
@@ -804,7 +856,7 @@ void fw_server_kick(struct fw_server* s) {
             wlr_output_schedule_frame(d->output);
         }
     }
-    wl_display_flush_clients(s->display);
+    flush(s);
 }
 
 bool fw_display_exists(struct fw_server* s, const char* module) { return find_display(s, module) != NULL; }
@@ -994,33 +1046,51 @@ void fw_touch(struct fw_server* s, const char* module, enum fw_touch_kind kind, 
         }
         if (kind == FW_TOUCH_UP) s->touching = false;
     }
-    wl_display_flush_clients(s->display);
+    flush(s);
 }
+
+// Characters typed as key presses: printable ASCII, newline and tab.
+static bool is_key_char(uint32_t cp) { return cp == '\n' || cp == '\t' || (cp >= 0x20 && cp < 0x7f); }
 
 void fw_text(struct fw_server* s, const char* module, const char* action, const char* text) {
     struct fw_display* d = find_display(s, module);
     if (!d || !d->visible || !s->seat->keyboard_state.focused_surface) return;
     if (strcmp(action, "insert") == 0 && text) {
-        // Text fields that speak text-input get whole strings (any script);
-        // everything else gets key presses from the growing keymap.
+        // ASCII goes as key presses: every field understands them, including
+        // ones that only listen to keys (e.g. one box per digit of a code).
+        // Other scripts go as whole strings through text-input when the
+        // field speaks it, else as keys from the growing keymap.
         struct fw_text_input* ti = focused_input(s);
-        if (ti && ti->input->current_enabled) {
-            wlr_text_input_v3_send_commit_string(ti->input, text);
-            wlr_text_input_v3_send_done(ti->input);
-        } else {
-            const char* p = text;
-            uint32_t cp;
-            while ((cp = next_utf8(&p)) != 0) {
-                uint32_t sym = cp == '\n' ? XKB_KEY_Return : cp == '\t' ? XKB_KEY_Tab : xkb_utf32_to_keysym(cp);
-                if (sym) tap(s, sym);
+        bool commit = ti && ti->input->current_enabled;
+        const char* p = text;
+        while (*p) {
+            const char* run = p;
+            uint32_t cp = next_utf8(&p);
+            if (!is_key_char(cp) && commit) {
+                const char* end = p;
+                while (*end) {  // the whole run of other characters in one string
+                    const char* q = end;
+                    if (is_key_char(next_utf8(&q))) break;
+                    end = q;
+                }
+                char* chunk = strndup(run, (size_t)(end - run));
+                if (chunk) {
+                    wlr_text_input_v3_send_commit_string(ti->input, chunk);
+                    wlr_text_input_v3_send_done(ti->input);
+                    free(chunk);
+                }
+                p = end;
+                continue;
             }
+            uint32_t sym = cp == '\n' ? XKB_KEY_Return : cp == '\t' ? XKB_KEY_Tab : xkb_utf32_to_keysym(cp);
+            if (sym) tap(s, sym);
         }
     } else if (strcmp(action, "backspace") == 0) {
         tap(s, XKB_KEY_BackSpace);
     } else if (strcmp(action, "enter") == 0) {
         tap(s, XKB_KEY_Return);
     }
-    wl_display_flush_clients(s->display);
+    flush(s);
 }
 
 int fw_windows(struct fw_server* s, struct fw_window* out, int max) {
