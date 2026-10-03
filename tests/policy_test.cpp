@@ -26,8 +26,11 @@ static void test_scopes() {
     CHECK(fw_scope_allows("wl_seat", nullptr, 0));
     CHECK(!fw_scope_allows("xdg_wm_base", nullptr, 0));
     CHECK(fw_scope_allows("xdg_wm_base", window, 1));
-    CHECK(!fw_scope_allows("wl_data_device_manager", window, 1));
-    CHECK(fw_scope_allows("wl_data_device_manager", all, 3));
+    // GTK 3 needs the data device manager for its seat; the clipboard itself
+    // is checked when used.
+    CHECK(fw_scope_allows("wl_data_device_manager", nullptr, 0));
+    CHECK(!fw_scope_allows("zwp_primary_selection_device_manager_v1", window, 1));
+    CHECK(fw_scope_allows("zwp_primary_selection_device_manager_v1", all, 3));
     CHECK(!fw_scope_allows("zwlr_screencopy_manager_v1", window, 1));
     CHECK(fw_scope_allows("zwlr_screencopy_manager_v1", all, 3));
     // Never, whatever was granted.

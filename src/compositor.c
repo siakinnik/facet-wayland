@@ -543,9 +543,31 @@ static void new_decoration(struct wl_listener* l, void* data) {
 
 // ------------------------------------------------------------------ clipboard
 
+// The clipboard is shared between apps whose modules hold wayland.clipboard;
+// the others neither put anything into it nor see what is there.
+static bool client_has_clipboard(struct fw_server* s, const struct wl_client* client) {
+    struct fw_display* d = client ? display_of_client(s, client) : NULL;
+    if (!d) return false;
+    struct fw_scopes* sc = find_scopes(s, d->module);
+    if (!sc) return false;
+    for (int i = 0; i < sc->n; ++i)
+        if (strcmp(sc->scopes[i], "wayland.clipboard") == 0) return true;
+    return false;
+}
+
+static bool selection_filter(struct wlr_seat_client* client, void* data) {
+    return client_has_clipboard(data, client->client);
+}
+
 static void request_selection(struct wl_listener* l, void* data) {
     struct fw_server* s = wl_container_of(l, s, request_selection);
     struct wlr_seat_request_set_selection_event* e = data;
+    // Only the focused client may set the selection (wlroots checks the serial).
+    struct wlr_seat_client* from = s->seat->keyboard_state.focused_client;
+    if (e->source && !client_has_clipboard(s, from ? from->client : NULL)) {
+        wlr_data_source_destroy(e->source);
+        return;
+    }
     wlr_seat_set_selection(s->seat, e->source, e->serial);
 }
 
@@ -1034,6 +1056,8 @@ struct fw_server* fw_server_create(const struct fw_callbacks* cb, char* error, i
 
     s->seat = wlr_seat_create(s->display, "seat0");
     wlr_seat_set_capabilities(s->seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_TOUCH);
+    s->seat->selection_filter = selection_filter;
+    s->seat->selection_filter_data = s;
     s->request_selection.notify = request_selection;
     wl_signal_add(&s->seat->events.request_set_selection, &s->request_selection);
     s->request_primary_selection.notify = request_primary_selection;

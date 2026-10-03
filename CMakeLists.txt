@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(facet-wayland VERSION 0.1.4 LANGUAGES C CXX)
+project(facet-wayland VERSION 0.1.5 LANGUAGES C CXX)
 set(WAYLAND_VERSION_SUFFIX "alpha")  # pre-release tag; empty for final releases; keep manifest.json in sync
 
 set(CMAKE_CXX_STANDARD 17)

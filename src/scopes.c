@@ -13,7 +13,8 @@ static const struct {
     {"xdg_activation_v1", "wayland.window"},
     {"zwp_text_input_manager_v3", "wayland.window"},
     // Clipboard, shared between the modules that hold this scope.
-    {"wl_data_device_manager", "wayland.clipboard"},
+    // wl_data_device_manager is for everyone: GTK 3 creates no input seat
+    // without it. The clipboard itself is checked in the compositor.
     {"zwp_primary_selection_device_manager_v1", "wayland.clipboard"},
     // Reading other windows' pixels.
     {"zwlr_screencopy_manager_v1", "wayland.screencopy"},

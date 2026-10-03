@@ -11,6 +11,38 @@ index cf967f9..528bffc 100644
  };
  
  /**
+diff --git a/include/wlr/types/wlr_seat.h b/include/wlr/types/wlr_seat.h
+index 06d8224..42ae5d2 100644
+--- a/include/wlr/types/wlr_seat.h
++++ b/include/wlr/types/wlr_seat.h
+@@ -243,6 +243,9 @@ struct wlr_seat {
+ 
+ 	struct wlr_data_source *selection_source;
+ 	uint32_t selection_serial;
++	// facet-wayland: whether a client may see the selection (clipboard); NULL = every client.
++	bool (*selection_filter)(struct wlr_seat_client *client, void *data);
++	void *selection_filter_data;
+ 	struct wl_list selection_offers; // wlr_data_offer.link
+ 
+ 	struct wlr_primary_selection_source *primary_selection_source;
+diff --git a/types/data_device/wlr_data_device.c b/types/data_device/wlr_data_device.c
+index 3b5b8a6..28af4a0 100644
+--- a/types/data_device/wlr_data_device.c
++++ b/types/data_device/wlr_data_device.c
+@@ -107,7 +107,12 @@ static void device_resource_send_selection(struct wl_resource *device_resource)
+ 		seat_client_from_data_device_resource(device_resource);
+ 	assert(seat_client != NULL);
+ 
+-	struct wlr_data_source *source = seat_client->seat->selection_source;
++	struct wlr_seat *seat = seat_client->seat;
++	struct wlr_data_source *source = seat->selection_source;
++	if (source != NULL && seat->selection_filter != NULL &&
++			!seat->selection_filter(seat_client, seat->selection_filter_data)) {
++		source = NULL;  // this client may not read the clipboard
++	}
+ 	if (source != NULL) {
+ 		struct wlr_data_offer *offer = data_offer_create(device_resource,
+ 			source, WLR_DATA_OFFER_SELECTION);
 diff --git a/types/wlr_linux_dmabuf_v1.c b/types/wlr_linux_dmabuf_v1.c
 index bfd9763..a034544 100644
 --- a/types/wlr_linux_dmabuf_v1.c

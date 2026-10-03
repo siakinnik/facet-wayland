@@ -127,8 +127,16 @@ public:
         fw_text(srv_, text_module_.c_str(), action.c_str(), text.c_str());
     }
 
+    // The keyboard covers the bottom of the screen: the window of the module
+    // that typed gets shorter, and its full height back when the keyboard
+    // closes (the text field may have lost the focus before that).
     void insets(int bottom) {
-        if (srv_ && !text_module_.empty()) fw_display_set_inset(srv_, text_module_.c_str(), bottom);
+        if (!srv_) return;
+        const std::string& module = !text_module_.empty() ? text_module_ : inset_module_;
+        if (module.empty()) return;
+        if (!inset_module_.empty() && inset_module_ != module) fw_display_set_inset(srv_, inset_module_.c_str(), 0);
+        fw_display_set_inset(srv_, module.c_str(), bottom);
+        inset_module_ = bottom > 0 ? module : std::string();
     }
 
     void tick() {
@@ -193,6 +201,7 @@ private:
             text_module_.clear();
             plugin_.text_input(false);
         }
+        if (inset_module_ == module) inset_module_.clear();
     }
 
     const std::string* module_of_surface(const std::string& surface) const {
@@ -267,7 +276,7 @@ private:
     std::string error_;
     std::map<std::string, Display> displays_;
     std::vector<facet::sdk::WaylandClient> windows_;
-    std::string text_module_;
+    std::string text_module_, inset_module_;
     bool windows_dirty_ = false;
     int next_id_ = 0;
 };

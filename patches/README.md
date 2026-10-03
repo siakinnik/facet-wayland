@@ -4,8 +4,9 @@
 after cloning them (see DEPS for the versions).
 
 - `wlroots-gpu-buffers.patch` changes wlroots 0.18.2: software renderers may
-  read single-plane linear dma-bufs, and linux-dmabuf works without access to
-  the DRM device. It contains parts of wlroots, which is under the MIT license:
+  read single-plane linear dma-bufs, linux-dmabuf works without access to
+  the DRM device, and the compositor decides which clients see the
+  clipboard. It contains parts of wlroots, which is under the MIT license:
 
 ```
 Copyright (c) 2017, 2018 Drew DeVault
