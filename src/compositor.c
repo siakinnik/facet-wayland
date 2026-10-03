@@ -1,6 +1,7 @@
 #define _GNU_SOURCE  // accept4
 #include "compositor.h"
 
+#include <drm_fourcc.h>
 #include <errno.h>
 #include <linux/input-event-codes.h>
 #include <stdarg.h>
@@ -23,6 +24,7 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_keyboard.h>
+#include <wlr/types/wlr_linux_dmabuf_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_primary_selection.h>
@@ -44,7 +46,17 @@
 #include "scopes.h"
 
 // Displays sit side by side in the layout, far enough apart never to touch.
-enum { DISPLAY_SPACING = 10000, MAX_SCOPES = 16 };
+enum { DISPLAY_SPACING = 10000, MAX_SCOPES = 16, GPU_SLOTS = 8 };
+
+struct fw_display;
+
+// A client's GPU buffer attached to the display's Facet surface.
+struct fw_slot {
+    struct fw_display* display;
+    struct wlr_buffer* buffer;  // NULL = free
+    bool locked;                // held for Facet (the client gets it back when unlocked)
+    struct wl_listener destroy;
+};
 
 struct fw_display {
     struct wl_list link;
@@ -58,7 +70,8 @@ struct fw_display {
     bool visible, pending, force;
     // Frame statistics, logged every 30 s while on screen.
     struct {
-        int frames, idle, waits, commits;
+        int frames, idle, waits, commits, gpu_frames;
+        char why[96];  // why the last frame did not go to Facet as it is
         double render_ms, copy_ms, wait_ms, wait_since, since;
     } stats;
     struct wlr_output* output;
@@ -67,6 +80,9 @@ struct fw_display {
     struct wlr_scene_rect* background;
     struct wl_list views;  // fw_view.link, topmost first
     struct wl_listener frame, output_destroy;
+    struct fw_slot slots[GPU_SLOTS];
+    int presented;               // slot Facet has not acknowledged yet, -1 if none
+    struct wlr_buffer* last_gpu; // the buffer presented last, NULL after a software frame
 };
 
 struct fw_client {
@@ -132,6 +148,8 @@ struct fw_server {
     struct wl_list displays, clients, inputs, scopes;
     struct fw_display* adding;  // display whose output is being created
     int next_slot;
+    bool gpu;  // clients may use GPU buffers
+    struct wlr_linux_dmabuf_v1* dmabuf;
     bool touching, touch_pointer;
     double touch_ox, touch_oy;
     char* text_module;  // module whose text field has the keyboard, NULL if none
@@ -551,9 +569,11 @@ static void log_stats(struct fw_display* d) {
     if (f || d->stats.waits || d->stats.commits)
         fprintf(stderr,
                 "wayland: %s: %.1f fps, %d app commits, %d idle frames, %d waits for Facet (%.1f ms total), "
-                "render %.1f ms, copy %.1f ms per frame\n",
+                "render %.1f ms, copy %.1f ms per frame, %d frames straight from the GPU%s%s\n",
                 d->module, f * 1000.0 / span, d->stats.commits, d->stats.idle, d->stats.waits, d->stats.wait_ms,
-                f ? d->stats.render_ms / f : 0.0, f ? d->stats.copy_ms / f : 0.0);
+                f > d->stats.gpu_frames ? d->stats.render_ms / (f - d->stats.gpu_frames) : 0.0,
+                f > d->stats.gpu_frames ? d->stats.copy_ms / (f - d->stats.gpu_frames) : 0.0, d->stats.gpu_frames,
+                d->stats.why[0] ? "; otherwise: " : "", d->stats.why);
     memset(&d->stats, 0, sizeof d->stats);
     d->stats.since = t;
 }
@@ -564,6 +584,218 @@ static void send_frame_done(struct fw_display* d) {
     wlr_scene_output_send_frame_done(d->scene_output, &now);
 }
 
+// ------------------------------------------------------------------ GPU buffers
+
+static void slot_clear(struct fw_slot* sl) {
+    if (!sl->buffer) return;
+    wl_list_remove(&sl->destroy.link);
+    if (sl->locked) wlr_buffer_unlock(sl->buffer);
+    sl->buffer = NULL;
+    sl->locked = false;
+}
+
+static void slot_destroy(struct wl_listener* l, void* data) {
+    (void)data;
+    struct fw_slot* sl = wl_container_of(l, sl, destroy);
+    struct fw_display* d = sl->display;
+    struct fw_server* s = d->server;
+    int i = (int)(sl - d->slots);
+    if (d->last_gpu == sl->buffer) d->last_gpu = NULL;
+    wl_list_remove(&sl->destroy.link);
+    sl->buffer = NULL;
+    sl->locked = false;
+    s->cb.gpu_detach(s->cb.data, d->module, i);
+}
+
+static void slots_reset(struct fw_display* d) {
+    for (int i = 0; i < GPU_SLOTS; ++i) slot_clear(&d->slots[i]);
+    d->presented = -1;
+    d->last_gpu = NULL;
+}
+
+// Hands back to clients the buffers Facet no longer shows.
+static void slots_release(struct fw_display* d) {
+    struct fw_server* s = d->server;
+    if (!s->gpu) return;
+    if (d->presented >= 0 && s->cb.gpu_ready(s->cb.data, d->module)) d->presented = -1;
+    int shown = s->cb.gpu_shown(s->cb.data, d->module);
+    for (int i = 0; i < GPU_SLOTS; ++i) {
+        struct fw_slot* sl = &d->slots[i];
+        if (sl->locked && i != shown && i != d->presented) {
+            wlr_buffer_unlock(sl->buffer);
+            sl->locked = false;
+        }
+    }
+}
+
+struct fw_cover {
+    int count;
+    struct wlr_scene_buffer* buffer;
+    int sx, sy;
+};
+
+static void count_buffer(struct wlr_scene_buffer* b, int sx, int sy, void* data) {
+    struct fw_cover* c = data;
+    if (++c->count == 1) {
+        c->buffer = b;
+        c->sx = sx;
+        c->sy = sy;
+    }
+}
+
+static bool gpu_format(uint32_t format) { return format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_ARGB8888; }
+
+// The client's GPU buffer if it alone is on the display, pixel for pixel,
+// from the top left corner over the whole width (the keyboard may make the
+// window shorter), else NULL (with the reason in the statistics).
+static struct wlr_buffer* covering_buffer(struct fw_display* d) {
+    char* why = d->stats.why;
+    size_t n = sizeof d->stats.why;
+    struct fw_cover c = {0};
+    wlr_scene_output_for_each_buffer(d->scene_output, count_buffer, &c);
+    if (c.count != 1 || !c.buffer->buffer) {
+        snprintf(why, n, "%d buffers on screen", c.count);
+        return NULL;
+    }
+    struct wlr_scene_buffer* sb = c.buffer;
+    struct wlr_client_buffer* cb = wlr_client_buffer_get(sb->buffer);
+    struct wlr_buffer* src = cb ? cb->source : sb->buffer;
+    struct wlr_dmabuf_attributes a;
+    if (!src || !wlr_buffer_get_dmabuf(src, &a)) {
+        snprintf(why, n, "%s", src ? "shared memory (the app draws in software)" : "buffer released");
+        return NULL;
+    }
+    if (a.n_planes != 1 || a.modifier != DRM_FORMAT_MOD_LINEAR || !gpu_format(a.format)) {
+        snprintf(why, n, "GPU buffer: %d planes, format 0x%x, modifier 0x%llx", a.n_planes, a.format,
+                 (unsigned long long)a.modifier);
+        return NULL;
+    }
+    int bw = sb->buffer->width, bh = sb->buffer->height;
+    // A source box of the whole buffer (viewporter) is the same as none.
+    const struct wlr_fbox* sbox = &sb->src_box;
+    bool whole = wlr_fbox_empty(sbox) || (sbox->x == 0 && sbox->y == 0 && (int)sbox->width == bw &&
+                                          (int)sbox->height == bh);
+    if (sb->transform != WL_OUTPUT_TRANSFORM_NORMAL || sb->opacity < 1.f || !whole) {
+        snprintf(why, n, "transform %d, opacity %.2f, source %.0f,%.0f %.0fx%.0f of %dx%d", (int)sb->transform,
+                 sb->opacity, sbox->x, sbox->y, sbox->width, sbox->height, bw, bh);
+        return NULL;
+    }
+    // On screen it must take exactly its pixels (logical size x scale).
+    int dw = sb->dst_width ? sb->dst_width * d->scale : bw, dh = sb->dst_height ? sb->dst_height * d->scale : bh;
+    if (c.sx != 0 || c.sy != 0 || bw != d->w || bh > d->h || dw != bw || dh != bh) {
+        snprintf(why, n, "window %dx%d (shown %dx%d) at %d,%d", bw, bh, dw, dh, c.sx, c.sy);
+        return NULL;
+    }
+    return src;
+}
+
+// The slot holding `b`, attaching it to a free one first; -1 if impossible.
+static int slot_for(struct fw_display* d, struct wlr_buffer* b) {
+    struct fw_server* s = d->server;
+    int free_slot = -1;
+    for (int i = 0; i < GPU_SLOTS; ++i) {
+        if (d->slots[i].buffer == b) return i;
+        if (!d->slots[i].buffer && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) {  // all taken: give up one Facet does not need
+        int shown = s->cb.gpu_shown(s->cb.data, d->module);
+        for (int i = 0; i < GPU_SLOTS && free_slot < 0; ++i)
+            if (!d->slots[i].locked && i != shown && i != d->presented) free_slot = i;
+        if (free_slot < 0) return -1;
+        slot_clear(&d->slots[free_slot]);
+        s->cb.gpu_detach(s->cb.data, d->module, free_slot);
+    }
+    struct wlr_dmabuf_attributes a;
+    if (!wlr_buffer_get_dmabuf(b, &a)) return -1;
+    if (!s->cb.gpu_attach(s->cb.data, d->module, free_slot, a.fd[0], a.format, a.modifier, a.offset[0], a.stride[0],
+                          a.width, a.height))
+        return -1;
+    struct fw_slot* sl = &d->slots[free_slot];
+    sl->display = d;
+    sl->buffer = b;
+    sl->locked = false;
+    sl->destroy.notify = slot_destroy;
+    wl_signal_add(&b->events.destroy, &sl->destroy);
+    return free_slot;
+}
+
+static bool check_dmabuf(struct wlr_dmabuf_attributes* a, void* data) {
+    (void)data;
+    return a->n_planes == 1 && a->modifier == DRM_FORMAT_MOD_LINEAR && gpu_format(a->format);
+}
+
+bool fw_server_enable_gpu(struct fw_server* s, uint64_t device) {
+    if (s->dmabuf || !s->cb.gpu_attach) return s->dmabuf != NULL;
+    struct wlr_linux_dmabuf_feedback_v1 fb = {.main_device = (dev_t)device};
+    wl_array_init(&fb.tranches);
+    struct wlr_linux_dmabuf_feedback_v1_tranche* t = wl_array_add(&fb.tranches, sizeof *t);
+    if (!t) return false;
+    memset(t, 0, sizeof *t);
+    t->target_device = (dev_t)device;
+    wlr_drm_format_set_add(&t->formats, DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR);
+    wlr_drm_format_set_add(&t->formats, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR);
+    s->dmabuf = wlr_linux_dmabuf_v1_create(s->display, 4, &fb);
+    wlr_drm_format_set_finish(&t->formats);
+    wl_array_release(&fb.tranches);
+    if (!s->dmabuf) return false;
+    wlr_linux_dmabuf_v1_set_check_dmabuf_callback(s->dmabuf, check_dmabuf, s);
+    s->gpu = true;
+    return true;
+}
+
+// A window drawn by the GPU that fills the display goes to Facet as it is:
+// true if this frame was handled so (or has to wait for Facet).
+static bool present_gpu(struct fw_display* d, bool damaged) {
+    struct fw_server* s = d->server;
+    if (!s->gpu) return false;
+    slots_release(d);
+    struct wlr_buffer* b = covering_buffer(d);
+    if (!b) {
+        if (d->last_gpu) {  // back to software: everything is drawn again
+            d->last_gpu = NULL;
+            wlr_damage_ring_add_whole(&d->scene_output->damage_ring);
+        }
+        return false;
+    }
+    if (b == d->last_gpu && !d->force) {  // nothing new
+        pixman_region32_clear(&d->scene_output->damage_ring.current);
+        if (!damaged) d->stats.idle++;
+        send_frame_done(d);
+        return true;
+    }
+    if (!s->cb.gpu_ready(s->cb.data, d->module)) {
+        if (!d->pending) {
+            d->stats.waits++;
+            d->stats.wait_since = now_ms_f();
+        }
+        d->pending = true;
+        return true;
+    }
+    int slot = slot_for(d, b);
+    if (slot < 0) {
+        snprintf(d->stats.why, sizeof d->stats.why, "no free slot, or Facet refused the buffer");
+        return false;
+    }
+    if (d->stats.wait_since > 0) {
+        d->stats.wait_ms += now_ms_f() - d->stats.wait_since;
+        d->stats.wait_since = 0;
+    }
+    struct fw_slot* sl = &d->slots[slot];
+    if (!sl->locked) {
+        wlr_buffer_lock(b);
+        sl->locked = true;
+    }
+    s->cb.gpu_present(s->cb.data, d->module, slot);
+    d->presented = slot;
+    d->last_gpu = b;
+    d->force = false;
+    d->stats.frames++;
+    d->stats.gpu_frames++;
+    pixman_region32_clear(&d->scene_output->damage_ring.current);
+    send_frame_done(d);
+    return true;
+}
+
 static void display_frame(struct wl_listener* l, void* data) {
     (void)data;
     struct fw_display* d = wl_container_of(l, d, frame);
@@ -572,6 +804,7 @@ static void display_frame(struct wl_listener* l, void* data) {
     if (!d->visible || !d->scene_output) return;
     bool damaged = d->output->needs_frame || pixman_region32_not_empty(&d->scene_output->damage_ring.current);
     log_stats(d);
+    if (present_gpu(d, damaged)) return;
     if (!d->force && !damaged) {
         d->stats.idle++;
         send_frame_done(d);
@@ -851,6 +1084,7 @@ void fw_server_dispatch(struct fw_server* s) {
 void fw_server_kick(struct fw_server* s) {
     struct fw_display* d;
     wl_list_for_each(d, &s->displays, link) {
+        slots_release(d);  // buffers Facet showed and replaced go back to their clients
         if (d->pending && d->output) {
             d->pending = false;
             wlr_output_schedule_frame(d->output);
@@ -865,6 +1099,7 @@ bool fw_display_add(struct fw_server* s, const char* module, const char* socket_
                     int error_len) {
     if (find_display(s, module)) return true;
     struct fw_display* d = calloc(1, sizeof *d);
+    if (d) d->presented = -1;
     if (!d) return false;
     d->server = s;
     d->module = strdup(module);
@@ -915,6 +1150,7 @@ fail:
 void fw_display_remove(struct fw_server* s, const char* module) {
     struct fw_display* d = find_display(s, module);
     if (!d) return;
+    slots_reset(d);
     struct fw_client *c, *tmp;
     wl_list_for_each_safe(c, tmp, &s->clients, link) if (c->display == d) wl_client_destroy(c->client);
     if (d->listen_source) wl_event_source_remove(d->listen_source);
@@ -944,6 +1180,7 @@ void fw_display_resize(struct fw_server* s, const char* module, int w, int h) {
     d->w = w;
     d->h = h;
     d->scale = scale_for(h);
+    slots_reset(d);  // Facet's surface is made anew: its GPU buffers too
     wlr_scene_rect_set_size(d->background, lw(d), h / d->scale);
     if (d->output) {
         struct wlr_output_state state;

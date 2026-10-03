@@ -28,6 +28,16 @@ struct fw_callbacks {
     // not); `numeric` for digits, numbers, phone numbers and PINs.
     void (*text_input)(void* data, const char* module, bool active, bool numeric);
     void (*windows_changed)(void* data);
+
+    // GPU buffers (fw_server_enable_gpu): a window that covers its display
+    // and was drawn by the GPU goes to Facet as it is. Slots 0..7 of the
+    // module's surface: attach a dma-buf once, present it per frame.
+    bool (*gpu_attach)(void* data, const char* module, int slot, int fd, uint32_t format, uint64_t modifier,
+                       uint32_t offset, uint32_t stride, int width, int height);
+    void (*gpu_detach)(void* data, const char* module, int slot);
+    bool (*gpu_ready)(void* data, const char* module);  // Facet took the last frame
+    void (*gpu_present)(void* data, const char* module, int slot);
+    int (*gpu_shown)(void* data, const char* module);  // slot on screen, -1 if none
 };
 
 struct fw_window {
@@ -40,6 +50,10 @@ struct fw_window {
 // Returns NULL and an English message in `error` on failure.
 struct fw_server* fw_server_create(const struct fw_callbacks* cb, char* error, int error_len);
 void fw_server_destroy(struct fw_server* s);
+// Offers clients GPU buffers (linux-dmabuf) on the graphics card `device`
+// (a dev_t of its render node): apps draw with the GPU. Linear buffers only,
+// so windows that do not cover their display can still be composed in software.
+bool fw_server_enable_gpu(struct fw_server* s, uint64_t device);
 // The event loop's fd: call fw_server_dispatch() when it is readable.
 int fw_server_fd(struct fw_server* s);
 void fw_server_dispatch(struct fw_server* s);

@@ -9,7 +9,8 @@ set -euo pipefail
 prefix="$(mkdir -p "$1" && cd "$1" && pwd)"
 jobs="${2:-$(nproc)}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
-stamp="$(grep -v '^#' "$root/DEPS" | sha256sum | cut -c1-16)"
+# Patches in patches/<name>-*.patch are applied after cloning <name>.
+stamp="$( (grep -v '^#' "$root/DEPS"; cat "$root"/patches/*.patch 2>/dev/null) | sha256sum | cut -c1-16)"
 
 if [[ -f "$prefix/.deps" && "$(cat "$prefix/.deps")" == "$stamp" ]]; then
     echo "dependencies $stamp already installed in $prefix"
@@ -50,6 +51,9 @@ grep -v '^#' "$root/DEPS" | while read -r name version url; do
     [[ -n "$name" ]] || continue
     echo "== $name $version"
     git -c advice.detachedHead=false clone -q --depth 1 --branch "$version" "$url" "$work/$name"
+    for patch in "$root"/patches/"$name"-*.patch; do
+        if [[ -f "$patch" ]]; then git -C "$work/$name" apply "$patch"; fi
+    done
     # shellcheck disable=SC2046
     "$meson" setup "$work/$name/build" "$work/$name" --prefix "$prefix" --libdir lib --buildtype release \
         -Ddefault_library=static $(options "$name") >"$work/$name.log" 2>&1 ||

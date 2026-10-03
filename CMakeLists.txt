@@ -21,7 +21,7 @@ endif()
 # (or FACET_CORE_DIR) is used when present, otherwise it is downloaded.
 # Capability endpoints and lent surfaces need facet-core 0.6.
 set(FACET_CORE_DIR "" CACHE PATH "facet-core checkout providing the SDK (default: ../facet-core, else download)")
-set(FACET_CORE_REF "v0.6.0-alpha" CACHE STRING "facet-core git ref to download the SDK from")
+set(FACET_CORE_REF "v0.7.0-alpha" CACHE STRING "facet-core git ref to download the SDK from")
 if(NOT FACET_CORE_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../facet-core/sdk/CMakeLists.txt")
     set(FACET_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../facet-core")
 endif()

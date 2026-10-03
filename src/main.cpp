@@ -48,6 +48,25 @@ public:
             static_cast<Server*>(self)->text_input(module, active, numeric);
         };
         cb.windows_changed = [](void* self) { static_cast<Server*>(self)->windows_dirty_ = true; };
+        cb.gpu_attach = [](void* self, const char* module, int slot, int fd, uint32_t format, uint64_t modifier,
+                           uint32_t offset, uint32_t stride, int width, int height) {
+            Surface* s = static_cast<Server*>(self)->surface_of(module);
+            return s && s->attach_buffer(slot, fd, format, modifier, offset, stride, width, height);
+        };
+        cb.gpu_detach = [](void* self, const char* module, int slot) {
+            if (Surface* s = static_cast<Server*>(self)->surface_of(module)) s->detach_buffer(slot);
+        };
+        cb.gpu_ready = [](void* self, const char* module) {
+            Surface* s = static_cast<Server*>(self)->surface_of(module);
+            return s && s->ready();
+        };
+        cb.gpu_present = [](void* self, const char* module, int slot) {
+            if (Surface* s = static_cast<Server*>(self)->surface_of(module)) s->present_buffer(slot);
+        };
+        cb.gpu_shown = [](void* self, const char* module) {
+            Surface* s = static_cast<Server*>(self)->surface_of(module);
+            return s ? s->shown_buffer() : -1;
+        };
         char err[256] = {};
         srv_ = fw_server_create(&cb, err, sizeof err);
         if (!srv_) {
@@ -56,6 +75,11 @@ public:
             return;
         }
         plugin_.watch_fd(fw_server_fd(srv_), [this] { fw_server_dispatch(srv_); });
+        // Facet draws with the GPU: apps may too, and their windows reach it without copies.
+        if (plugin_.gpu_buffers() && plugin_.gpu_device_id()) {
+            if (fw_server_enable_gpu(srv_, plugin_.gpu_device_id())) Plugin::log("wayland: apps may draw with the GPU");
+            else Plugin::log("wayland: GPU buffers are unavailable; apps draw in software");
+        }
         Plugin::log("wayland: compositor ready");
     }
 
@@ -175,6 +199,11 @@ private:
         for (const auto& [module, d] : displays_)
             if (d.surface_id == surface) return &module;
         return nullptr;
+    }
+
+    Surface* surface_of(const char* module) {
+        auto it = displays_.find(module);
+        return it == displays_.end() ? nullptr : it->second.surface.get();
     }
 
     uint32_t* frame_target(const char* module, int w, int h) {

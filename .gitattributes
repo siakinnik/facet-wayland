@@ -5,3 +5,4 @@
 *.env text eol=lf
 DEPS text eol=lf
 command text eol=lf
+*.patch text eol=lf

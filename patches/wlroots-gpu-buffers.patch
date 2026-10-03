@@ -1,0 +1,94 @@
+diff --git a/include/wlr/types/wlr_linux_dmabuf_v1.h b/include/wlr/types/wlr_linux_dmabuf_v1.h
+index cf967f9..528bffc 100644
+--- a/include/wlr/types/wlr_linux_dmabuf_v1.h
++++ b/include/wlr/types/wlr_linux_dmabuf_v1.h
+@@ -27,6 +27,8 @@ struct wlr_dmabuf_v1_buffer {
+ 	// private state
+ 
+ 	struct wl_listener release;
++	void *cpu_map; // begin_data_ptr_access() mapping of a linear buffer
++	size_t cpu_map_size;
+ };
+ 
+ /**
+diff --git a/types/wlr_linux_dmabuf_v1.c b/types/wlr_linux_dmabuf_v1.c
+index bfd9763..a034544 100644
+--- a/types/wlr_linux_dmabuf_v1.c
++++ b/types/wlr_linux_dmabuf_v1.c
+@@ -1,5 +1,7 @@
+ #include <assert.h>
+ #include <drm_fourcc.h>
++#include <linux/dma-buf.h>
++#include <sys/ioctl.h>
+ #include <fcntl.h>
+ #include <stdlib.h>
+ #include <sys/mman.h>
+@@ -118,9 +120,49 @@ static bool buffer_get_dmabuf(struct wlr_buffer *wlr_buffer,
+ 	return true;
+ }
+ 
++// Lets software renderers read single-plane linear buffers (facet-wayland:
++// popups over a window drawn by the GPU are composed with pixman).
++static bool buffer_begin_data_ptr_access(struct wlr_buffer *wlr_buffer,
++		uint32_t flags, void **data, uint32_t *format, size_t *stride) {
++	struct wlr_dmabuf_v1_buffer *buffer =
++		dmabuf_v1_buffer_from_buffer(wlr_buffer);
++	struct wlr_dmabuf_attributes *a = &buffer->attributes;
++	if (a->n_planes != 1 || a->modifier != DRM_FORMAT_MOD_LINEAR ||
++			(flags & WLR_BUFFER_DATA_PTR_ACCESS_WRITE)) {
++		return false;
++	}
++	size_t size = (size_t)a->offset[0] + (size_t)a->stride[0] * (size_t)a->height;
++	void *map = mmap(NULL, size, PROT_READ, MAP_SHARED, a->fd[0], 0);
++	if (map == MAP_FAILED) {
++		return false;
++	}
++	struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
++	ioctl(a->fd[0], DMA_BUF_IOCTL_SYNC, &sync);
++	buffer->cpu_map = map;
++	buffer->cpu_map_size = size;
++	*data = (char *)map + a->offset[0];
++	*format = a->format;
++	*stride = a->stride[0];
++	return true;
++}
++
++static void buffer_end_data_ptr_access(struct wlr_buffer *wlr_buffer) {
++	struct wlr_dmabuf_v1_buffer *buffer =
++		dmabuf_v1_buffer_from_buffer(wlr_buffer);
++	if (buffer->cpu_map == NULL) {
++		return;
++	}
++	struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
++	ioctl(buffer->attributes.fd[0], DMA_BUF_IOCTL_SYNC, &sync);
++	munmap(buffer->cpu_map, buffer->cpu_map_size);
++	buffer->cpu_map = NULL;
++}
++
+ static const struct wlr_buffer_impl buffer_impl = {
+ 	.destroy = buffer_destroy,
+ 	.get_dmabuf = buffer_get_dmabuf,
++	.begin_data_ptr_access = buffer_begin_data_ptr_access,
++	.end_data_ptr_access = buffer_end_data_ptr_access,
+ };
+ 
+ static void buffer_handle_release(struct wl_listener *listener, void *data) {
+@@ -891,13 +933,12 @@ static bool set_default_feedback(struct wlr_linux_dmabuf_v1 *linux_dmabuf,
+ 	}
+ 
+ 	drmDevice *device = NULL;
+-	if (drmGetDeviceFromDevId(feedback->main_device, 0, &device) != 0) {
+-		wlr_log_errno(WLR_ERROR, "drmGetDeviceFromDevId failed");
+-		goto error_compiled;
+-	}
+-
+ 	int main_device_fd = -1;
+-	if (device->available_nodes & (1 << DRM_NODE_RENDER)) {
++	if (drmGetDeviceFromDevId(feedback->main_device, 0, &device) != 0) {
++		// facet-wayland: the compositor runs without the GPU (no sysfs or
++		// device nodes in its container); buffers are passed on unchecked.
++		wlr_log(WLR_DEBUG, "DRM device unavailable, skipping DMA-BUF import checks");
++	} else if (device->available_nodes & (1 << DRM_NODE_RENDER)) {
+ 		const char *name = device->nodes[DRM_NODE_RENDER];
+ 		main_device_fd = open(name, O_RDWR | O_CLOEXEC);
+ 		drmFreeDevice(&device);
