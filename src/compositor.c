@@ -339,8 +339,11 @@ static void configure_view(struct fw_view* v) {
         return;
     }
     // Apps fill their display, like on a phone; no window frames to drag.
+    // Full screen (kiosk browsers, video) when they ask: the same size, without
+    // their own bars.
     wlr_xdg_toplevel_set_size(v->toplevel, lw(d), lh(d) > 1 ? lh(d) : 1);
-    wlr_xdg_toplevel_set_maximized(v->toplevel, true);
+    wlr_xdg_toplevel_set_fullscreen(v->toplevel, v->toplevel->requested.fullscreen);
+    wlr_xdg_toplevel_set_maximized(v->toplevel, !v->toplevel->requested.fullscreen);
     wlr_xdg_toplevel_set_tiled(v->toplevel, WLR_EDGE_TOP | WLR_EDGE_BOTTOM | WLR_EDGE_LEFT | WLR_EDGE_RIGHT);
 }
 
@@ -403,7 +406,7 @@ static void view_request_maximize(struct wl_listener* l, void* data) {
 static void view_request_fullscreen(struct wl_listener* l, void* data) {
     (void)data;
     struct fw_view* v = wl_container_of(l, v, request_fullscreen);
-    if (v->toplevel->base->initialized) wlr_xdg_surface_schedule_configure(v->toplevel->base);
+    if (v->toplevel->base->initialized) configure_view(v);
 }
 
 static void view_destroy(struct wl_listener* l, void* data) {

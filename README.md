@@ -106,3 +106,16 @@ src/i18n/          translations
 examples/          desktop-app: template of an app module
 scripts/build-deps.sh   builds the pinned libraries (DEPS) statically
 ```
+
+## Licenses
+
+- This project: GPL-3.0 (LICENSE); its sources are this repository at each
+  release tag.
+- The release executables are static: glibc (LGPL-2.1-or-later), the GCC runtime, libffi and the libraries built from source in DEPS (wayland, wayland-protocols, pixman, libdrm, libxkbcommon, wlroots: MIT/X11 licenses, texts in `third-party-licenses/`) are built into them. Their
+  licenses are in every release archive under `licenses/` (the packages they
+  come from, with exact versions, in `licenses/STATIC`, and the full texts in
+  `licenses/common-licenses/`).
+- `patches/` changes wlroots; see `patches/README.md` for its license.
+- Every release has `facet-wayland-<version>-sources.tar` with the sources of all of
+  that, including the libraries in DEPS at their tags and the patches. GCC's runtime (libstdc++, libgcc) is under the GCC Runtime
+  Library Exception, which asks for no sources.

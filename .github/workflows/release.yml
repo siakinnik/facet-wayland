@@ -102,8 +102,30 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          path: src
+
+      # The sources of the libraries built into or shipped with the binaries
+      # (LGPL glibc, ...), published next to them.
+      - name: Sources of the bundled libraries
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p packed
+          for f in dist/*.tar.gz; do tar -C packed -xzf "$f"; done
+          entries=()
+          while read -r f; do entries+=("host:$f"); done < <(find packed -path '*/licenses/STATIC')
+          while read -r n v u; do
+            [[ -z "$n" || "$n" == \#* ]] && continue
+            entries+=("git:$n=$u@$v")
+          done < src/DEPS
+          for p in src/patches/*.patch; do entries+=("file:$p"); done
+          bash src/scripts/ci/sources.sh "dist/facet-wayland-$VERSION-sources.tar" "${entries[@]}"
+
       - name: Checksums
-        run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum *.tar* > SHA256SUMS && cat SHA256SUMS
 
       - name: Publish release
         env:
