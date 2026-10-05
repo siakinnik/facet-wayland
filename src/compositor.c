@@ -653,19 +653,33 @@ static void slots_release(struct fw_display* d) {
     }
 }
 
+// The buffers on a display, bottom to top (the scene's drawing order).
+enum { COVER_MAX = 16 };
 struct fw_cover {
-    int count;
-    struct wlr_scene_buffer* buffer;
-    int sx, sy;
+    int count, ox, oy;
+    struct {
+        struct wlr_scene_buffer* buffer;
+        int sx, sy;
+    } at[COVER_MAX];
 };
 
+// Positions come in layout coordinates; displays sit side by side in the
+// layout, so they are made relative to this display.
 static void count_buffer(struct wlr_scene_buffer* b, int sx, int sy, void* data) {
     struct fw_cover* c = data;
-    if (++c->count == 1) {
-        c->buffer = b;
-        c->sx = sx;
-        c->sy = sy;
+    if (c->count < COVER_MAX) {
+        c->at[c->count].buffer = b;
+        c->at[c->count].sx = sx - c->ox;
+        c->at[c->count].sy = sy - c->oy;
     }
+    ++c->count;
+}
+
+// A buffer's place on the display in logical units.
+static struct wlr_box cover_box(struct fw_display* d, struct wlr_scene_buffer* b, int sx, int sy) {
+    int w = b->dst_width ? b->dst_width : (b->buffer ? b->buffer->width / d->scale : 0);
+    int h = b->dst_height ? b->dst_height : (b->buffer ? b->buffer->height / d->scale : 0);
+    return (struct wlr_box){sx, sy, w, h};
 }
 
 static bool gpu_format(uint32_t format) { return format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_ARGB8888; }
@@ -677,12 +691,38 @@ static struct wlr_buffer* covering_buffer(struct fw_display* d) {
     char* why = d->stats.why;
     size_t n = sizeof d->stats.why;
     struct fw_cover c = {0};
+    c.ox = d->scene_output->x;
+    c.oy = d->scene_output->y;
     wlr_scene_output_for_each_buffer(d->scene_output, count_buffer, &c);
-    if (c.count != 1 || !c.buffer->buffer) {
+    if (c.count < 1 || c.count > COVER_MAX || !c.at[c.count - 1].buffer->buffer) {
         snprintf(why, n, "%d buffers on screen", c.count);
         return NULL;
     }
-    struct wlr_scene_buffer* sb = c.buffer;
+    // The topmost one, if it hides all the others (an app's window under the
+    // surface its content is drawn into, as Firefox does).
+    struct wlr_scene_buffer* sb = c.at[c.count - 1].buffer;
+    int top_x = c.at[c.count - 1].sx, top_y = c.at[c.count - 1].sy;
+    struct wlr_box top = cover_box(d, sb, top_x, top_y);
+    for (int i = 0; i + 1 < c.count; ++i) {
+        struct wlr_box o = cover_box(d, c.at[i].buffer, c.at[i].sx, c.at[i].sy);
+        if (o.x < top.x || o.y < top.y || o.x + o.width > top.x + top.width || o.y + o.height > top.y + top.height) {
+            snprintf(why, n, "%d buffers on screen, not all under the top one", c.count);
+            return NULL;
+        }
+    }
+    if (c.count > 1) {
+        // Hiding them takes an opaque top: no alpha, or an opaque region over all of it.
+        struct wlr_dmabuf_attributes ta;
+        struct wlr_client_buffer* tcb = wlr_client_buffer_get(sb->buffer);
+        struct wlr_buffer* tsrc = tcb ? tcb->source : sb->buffer;
+        bool no_alpha = tsrc && wlr_buffer_get_dmabuf(tsrc, &ta) && ta.format == DRM_FORMAT_XRGB8888;
+        bool opaque = pixman_region32_contains_rectangle(
+                          &sb->opaque_region, &(pixman_box32_t){0, 0, top.width, top.height}) == PIXMAN_REGION_IN;
+        if (!no_alpha && !opaque) {
+            snprintf(why, n, "%d buffers on screen, the top one is not opaque", c.count);
+            return NULL;
+        }
+    }
     struct wlr_client_buffer* cb = wlr_client_buffer_get(sb->buffer);
     struct wlr_buffer* src = cb ? cb->source : sb->buffer;
     struct wlr_dmabuf_attributes a;
@@ -707,8 +747,8 @@ static struct wlr_buffer* covering_buffer(struct fw_display* d) {
     }
     // On screen it must take exactly its pixels (logical size x scale).
     int dw = sb->dst_width ? sb->dst_width * d->scale : bw, dh = sb->dst_height ? sb->dst_height * d->scale : bh;
-    if (c.sx != 0 || c.sy != 0 || bw != d->w || bh > d->h || dw != bw || dh != bh) {
-        snprintf(why, n, "window %dx%d (shown %dx%d) at %d,%d", bw, bh, dw, dh, c.sx, c.sy);
+    if (top_x != 0 || top_y != 0 || bw != d->w || bh > d->h || dw != bw || dh != bh) {
+        snprintf(why, n, "window %dx%d (shown %dx%d) at %d,%d", bw, bh, dw, dh, top_x, top_y);
         return NULL;
     }
     return src;

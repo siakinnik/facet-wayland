@@ -156,6 +156,10 @@ public:
         }
     }
 
+    void kick() {
+        if (srv_) fw_server_kick(srv_);
+    }
+
     void refresh() {
         if (displays_.empty()) plugin_.end_background();
         else plugin_.begin_background(tr("Showing the windows of {} apps", {std::to_string(displays_.size())}));
@@ -301,6 +305,8 @@ int main() {
     plugin.on_visible = [&](bool) { server.refresh(); };
     plugin.on_locale = [&](const std::string&) { server.refresh(); };
     plugin.on_tick = [&] { server.tick(); };
+    // Facet took a frame: the next one may be drawn now, not on the next tick.
+    plugin.on_surface_shown = [&](const std::string&) { server.kick(); };
     plugin.on_shutdown = [&] { server.stop(); };
     return plugin.run(16);
 }

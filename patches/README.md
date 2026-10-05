@@ -1,8 +1,13 @@
 # Patches to the bundled libraries
 
 `scripts/build-deps.sh` applies `<library>-*.patch` to the library's sources
-after cloning them (see DEPS for the versions).
+after cloning them (see DEPS for the versions), in the order of their names.
 
+- `wlroots-memfd.patch` changes wlroots 0.18.2: shared-memory buffers
+  (`allocate_shm_file`) come from `memfd_create()` first and from
+  `shm_open()` only if that fails. A container's `/dev/shm` is small (64 MB
+  in Facet's), and a buffer that does not fit only shows up as SIGBUS when
+  it is written; several 4K displays need about 33 MB each.
 - `wlroots-gpu-buffers.patch` changes wlroots 0.18.2: software renderers may
   read single-plane linear dma-bufs, linux-dmabuf works without access to
   the DRM device, and the compositor decides which clients see the
