@@ -68,9 +68,10 @@ struct fw_display {
     int x, w, h, inset;  // w, h, inset in pixels
     int scale;            // output scale; windows, layout and input use w / scale
     bool visible, pending, force;
+    double hidden_frame_ms;  // when a hidden display last let its apps draw
     // Frame statistics, logged every 30 s while on screen.
     struct {
-        int frames, idle, waits, commits, gpu_frames;
+        int frames, idle, waits, commits, gpu_frames, hidden;
         char why[96];  // why the last frame did not go to Facet as it is
         double render_ms, copy_ms, wait_ms, wait_since, since;
     } stats;
@@ -591,6 +592,9 @@ static void log_stats(struct fw_display* d) {
     double span = t - d->stats.since;
     if (span < 30000) return;
     int f = d->stats.frames;
+    if (d->stats.hidden)
+        fprintf(stderr, "wayland: %s: not on screen, %d frames let through in the background\n", d->module,
+                d->stats.hidden);
     if (f || d->stats.waits || d->stats.commits)
         fprintf(stderr,
                 "wayland: %s: %.1f fps, %d app commits, %d idle frames, %d waits for Facet (%.1f ms total), "
@@ -1148,9 +1152,30 @@ void fw_server_dispatch(struct fw_server* s) {
     flush(s);
 }
 
+// How often the apps of a display that is not on screen are told to draw.
+#define HIDDEN_FRAME_MS 500.0
+
 void fw_server_kick(struct fw_server* s) {
     struct fw_display* d;
     wl_list_for_each(d, &s->displays, link) {
+        if (!d->visible) {
+            // Not on screen: the apps keep running, but nothing is composited or
+            // copied for them. They get a frame callback now and then so that
+            // none waits for one for good (an app drawing with the GPU stops in
+            // eglSwapBuffers, and with it everything else it does, such as
+            // answering a call); what they draw is dropped, and repaint() shows
+            // it all again when the display comes back.
+            double now = now_ms_f();
+            if (d->scene_output && now - d->hidden_frame_ms >= HIDDEN_FRAME_MS) {
+                d->hidden_frame_ms = now;
+                pixman_region32_clear(&d->scene_output->damage_ring.current);
+                send_frame_done(d);
+                d->stats.hidden++;
+                log_stats(d);
+            }
+            d->pending = false;
+            continue;
+        }
         slots_release(d);  // buffers Facet showed and replaced go back to their clients
         if (d->pending && d->output) {
             d->pending = false;
