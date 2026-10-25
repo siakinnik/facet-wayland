@@ -4,6 +4,7 @@
 // shows on that module's screen, through a surface lent to it. Facet stays the
 // owner of the real screen and of input; this module only plays along through
 // the generic plugin SDK.
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <string>
@@ -34,6 +35,7 @@ public:
 
     void start() {
         if (srv_) return;
+        load_setting();
         if (!plugin_.has_permission("display.surface") || !plugin_.has_permission("wayland.compositor")) {
             error_ = tr("Missing permissions.");
             return;
@@ -139,10 +141,21 @@ public:
         inset_module_ = bottom > 0 ? module : std::string();
     }
 
+    void event(const std::string& id, const Json& value) {
+        if (id != "res") return;
+        half_ = value.as_int(0) == 0;
+        if (FILE* f = std::fopen(setting_path().c_str(), "w")) {
+            std::fputs(half_ ? "half\n" : "native\n", f);
+            std::fclose(f);
+        }
+        tick();  // the displays follow
+        refresh();
+    }
+
     void tick() {
         if (!srv_) return;
         // Displays follow the screen size (rotation, another panel).
-        int w = screen_w(), h = screen_h();
+        int w = display_w(), h = display_h();
         for (auto& [module, d] : displays_) {
             if (d.surface->width() == w && d.surface->height() == h) continue;
             d.surface->create(plugin_, d.surface_id, w, h, module);
@@ -176,6 +189,20 @@ private:
     std::string tr(std::string_view k, const std::vector<std::string>& a) const { return plugin_.tr(k, a); }
     int screen_w() const { return plugin_.screen_width() > 0 ? plugin_.screen_width() : 1280; }
     int screen_h() const { return plugin_.screen_height() > 0 ? plugin_.screen_height() : 800; }
+    // Apps on a high-density screen (scale 2 in the compositor) draw four times the pixels the
+    // layout needs. "Half" gives them a display of half the size: the same layout, a quarter of
+    // the pixels to draw, which Facet stretches over the screen.
+    int divisor() const { return half_ && screen_h() >= 1800 ? 2 : 1; }
+    int display_w() const { return screen_w() / divisor(); }
+    int display_h() const { return screen_h() / divisor(); }
+    std::string setting_path() const { return plugin_.data_dir() + "/app_resolution"; }
+    void load_setting() {
+        if (FILE* f = std::fopen(setting_path().c_str(), "r")) {
+            char buf[16] = {};
+            if (std::fgets(buf, sizeof buf, f)) half_ = std::string(buf).rfind("native", 0) != 0;
+            std::fclose(f);
+        }
+    }
 
     void add(const std::string& module, const std::string& dir) {
         if (dir.empty()) {
@@ -185,16 +212,16 @@ private:
         Display d;
         d.surface = std::make_unique<Surface>();
         d.surface_id = "wl" + std::to_string(++next_id_);
-        if (!d.surface->create(plugin_, d.surface_id, screen_w(), screen_h(), module)) {
+        if (!d.surface->create(plugin_, d.surface_id, display_w(), display_h(), module)) {
             Plugin::log("wayland: no surface for %s", module.c_str());
             return;
         }
         char err[256] = {};
-        if (!fw_display_add(srv_, module.c_str(), dir.c_str(), screen_w(), screen_h(), err, sizeof err)) {
+        if (!fw_display_add(srv_, module.c_str(), dir.c_str(), display_w(), display_h(), err, sizeof err)) {
             Plugin::log("wayland: %s: %s", module.c_str(), err);
             return;
         }
-        Plugin::log("wayland: display for %s (%dx%d)", module.c_str(), screen_w(), screen_h());
+        Plugin::log("wayland: display for %s (%dx%d)", module.c_str(), display_w(), display_h());
         displays_[module] = std::move(d);
     }
 
@@ -256,6 +283,10 @@ private:
             ui.info(tr("State"), tr("running"), "good");
             ui.info(tr("Screen size"), std::to_string(screen_w()) + " × " + std::to_string(screen_h()));
         }
+        ui.section(tr("Quality"));
+        ui.select("res", tr("App resolution"), {tr("Half (faster)"), tr("Native")}, half_ ? 0 : 1);
+        ui.note(tr("On a 4K screen apps draw four times as many pixels. Half keeps their layout and makes them "
+                   "much smoother; Native is sharper but slower."));
         ui.section(tr("Apps"));
         if (displays_.empty())
             ui.note(tr("No app uses Wayland yet. Modules that need it (a browser, messengers) show their "
@@ -282,6 +313,7 @@ private:
     std::vector<facet::sdk::WaylandClient> windows_;
     std::string text_module_, inset_module_;
     bool windows_dirty_ = false;
+    bool half_ = true;  // see divisor()
     int next_id_ = 0;
 };
 
@@ -291,6 +323,7 @@ int main() {
     Plugin plugin("wayland", WAYLAND_VERSION);  // keep in sync with manifest.json
     wayland::register_translations(plugin.catalog());
     Server server(plugin);
+    plugin.on_event = [&](const std::string& id, const Json& value) { server.event(id, value); };
     plugin.on_hello = [&](const Json&) {
         server.start();
         server.refresh();
